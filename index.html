@@ -147,6 +147,16 @@
 const $ = function(id){ return document.getElementById(id); };
 const COLORS = ['#e0564a','#e8a530','#4fae5b','#3c9bd6','#8a63d2','#d85fa3','#3fb8a8','#9a7b4f'];
 const MAX_LAYERS = 8, LABEL_MAX = 768, TEX_MAX = 1024;
+// 自動分割の調整値（奥行きは 0〜100、色は Lab の距離）
+const SP_COUNT = 1600,     // 小さな領域のおおよその数
+      SP_COMPACT = 10,     // 大きいほど領域の形が整う（小さいほど色の境目に沿う）
+      SP_DEPTH = 0.6,      // 領域づくりで奥行きの差をどれだけ重く見るか
+      MERGE_COLOR = 6,     // これより色が近い隣どうしはつなぐ
+      MERGE_DEPTH = 5,     // ただし奥行きにこれ以上の段差があればつながない
+      LEVEL_GAP = 7,       // 段どうしの奥行きがこれより近ければ1つにまとめる
+      SOFT_COLOR = 9,      // 色の差がこれより小さい境目は、奥行きの等高線でなめらかに切る
+      CUT_SNAP = 5,        // 段の境目を、物と物のすき間へ寄せるときに動かしてよい幅
+      ISLAND = 0.002;      // 画像のこの割合より小さい飛び地は周りに吸収
 
 /* ---------- 状態 ---------- */
 const S = {
@@ -155,6 +165,7 @@ const S = {
   px:null,             // small の RGBA
   LW:0, LH:0,
   labels:null,         // 各画素がどの層か（0 = 土台だけ）
+  depth:null,          // 奥行き推定の結果（大きいほど手前）。画像ごとに1回だけ求める
   layers:[],           // 奥 → 手前。{id,color}
   active:0, nextId:1,
   tool:'wand', tol:38, size:16, pick:0,
@@ -197,16 +208,17 @@ function setImage(src){   // src: canvas か img
   S.LW=s[0]; S.LH=s[1];
   S.px = scx.getImageData(0,0,s[0],s[1]).data;
   S.labels = new Uint8Array(s[0]*s[1]);
+  S.depth = null; DEPTH.image++;
   S.layers = []; S.nextId = 1; S.active = 0; S.undo = []; $('undoBtn').disabled = true;
   const pc = $('paint'); pc.width=s[0]; pc.height=s[1];
   structDirty = true; maskDirty = true;
   aiEmbed();
 }
 
-/* ---------- 自動で分ける ----------
+/* ---------- 自動で分ける（奥行きAIが使えないときの予備） ----------
    色でまとまりを作り、「背景から数えて何重に囲まれているか」で層を決める。
    背景=土台、背景に接するもの=1層目、その内側にあるもの=2層目…… */
-function autoSplit(maxDepth){
+function colorSplit(maxDepth){
   const W=S.LW,H=S.LH,N=W*H,k=12;
   // 紙のざらつきのような細かい模様で分かれないよう、色を見る前に少しぼかす
   let px=S.px;
@@ -301,6 +313,192 @@ function autoSplit(maxDepth){
   structDirty=true; maskDirty=true;
 }
 
+/* ---------- 自動で分ける（奥行きAI） ----------
+   奥行き推定AIで「手前〜奥」を求め、色の境目に沿った小さな領域ごとに層を決める。
+   1. 色と奥行きが似た画素を小さな領域（スーパーピクセル）にまとめる … 輪郭が絵の境目に沿う
+   2. 色がほぼ同じで奥行きが連続する隣どうしをつなぐ … 1つの面・物体がばらけない
+   3. 領域の奥行きを、自然な切れ目でいくつかの段に分ける … 前後の順番が奥行きどおりになる
+   4. 小さな飛び地を周りの層に吸収する */
+function depthSplit(dep, maxLayers){
+  const W=S.LW,H=S.LH,N=W*H,px=S.px;
+  // 奥行きを 0（奥）〜100（手前）に
+  let lo=1e9,hi=-1e9; for(let p=0;p<N;p++){ const v=dep[p]; if(v<lo) lo=v; if(v>hi) hi=v; }
+  if(!(hi-lo>1e-6)) return false;
+  const D=new Float32Array(N); for(let p=0;p<N;p++) D[p]=(dep[p]-lo)/(hi-lo)*100;
+  // 色を Lab に（見た目の色の差に近い）。細かい模様で割れないよう少しぼかす
+  const g=new Float32Array(256); for(let i=0;i<256;i++){ const c=i/255; g[i]= c<=0.04045 ? c/12.92 : Math.pow((c+0.055)/1.055,2.4); }
+  function f(t){ return t>0.008856 ? Math.cbrt(t) : 7.787*t+16/116; }
+  let L=new Float32Array(N),A=new Float32Array(N),B=new Float32Array(N);
+  for(let p=0;p<N;p++){ const r=g[px[p*4]],gg=g[px[p*4+1]],b=g[px[p*4+2]];
+    const fx=f((0.4124*r+0.3576*gg+0.1805*b)/0.9505), fy=f(0.2126*r+0.7152*gg+0.0722*b), fz=f((0.0193*r+0.1192*gg+0.9505*b)/1.089);
+    L[p]=116*fy-16; A[p]=500*(fx-fy); B[p]=200*(fy-fz); }
+  function blur(a){ const t=new Float32Array(N), o=new Float32Array(N);
+    for(let y=0;y<H;y++){ const r=y*W; for(let x=0;x<W;x++){ const p=r+x; t[p]=(a[x>0?p-1:p]+a[p]*2+a[x<W-1?p+1:p])/4; } }
+    for(let p=0;p<N;p++) o[p]=(t[p>=W?p-W:p]+t[p]*2+t[p<N-W?p+W:p])/4;
+    return o; }
+  L=blur(L); A=blur(A); B=blur(B);
+
+  // 1. スーパーピクセル（SLIC）。距離 = 色の差 + 奥行きの差 + 位置の差
+  const step=Math.max(5,Math.round(Math.sqrt(N/SP_COUNT))), gw=Math.max(1,Math.round(W/step)), gh=Math.max(1,Math.round(H/step)), K=gw*gh;
+  const cx=new Float32Array(K),cy=new Float32Array(K),cl=new Float32Array(K),ca=new Float32Array(K),cb=new Float32Array(K),cd=new Float32Array(K);
+  for(let j=0;j<gh;j++) for(let i=0;i<gw;i++){ const k=j*gw+i, x=Math.min(W-1,Math.floor((i+0.5)*W/gw)), y=Math.min(H-1,Math.floor((j+0.5)*H/gh)), p=y*W+x;
+    cx[k]=x; cy[k]=y; cl[k]=L[p]; ca[k]=A[p]; cb[k]=B[p]; cd[k]=D[p]; }
+  const sp=new Int32Array(N), best=new Float32Array(N), ws=(SP_COMPACT/step)*(SP_COMPACT/step);
+  const acc=new Float64Array(K*7);
+  for(let it=0;it<6;it++){
+    best.fill(Infinity);
+    for(let k=0;k<K;k++){
+      const x0=Math.max(0,Math.floor(cx[k]-step)), x1=Math.min(W-1,Math.ceil(cx[k]+step)), y0=Math.max(0,Math.floor(cy[k]-step)), y1=Math.min(H-1,Math.ceil(cy[k]+step));
+      const kl=cl[k],ka=ca[k],kb=cb[k],kd=cd[k],kx=cx[k],ky=cy[k];
+      for(let y=y0;y<=y1;y++){ const dy2=(y-ky)*(y-ky); for(let x=x0;x<=x1;x++){ const p=y*W+x;
+        const d=(L[p]-kl)*(L[p]-kl)+(A[p]-ka)*(A[p]-ka)+(B[p]-kb)*(B[p]-kb)+SP_DEPTH*(D[p]-kd)*(D[p]-kd)+ws*((x-kx)*(x-kx)+dy2);
+        if(d<best[p]){ best[p]=d; sp[p]=k; } } }
+    }
+    acc.fill(0);
+    for(let p=0;p<N;p++){ const o=sp[p]*7; acc[o]+=p%W; acc[o+1]+=(p/W)|0; acc[o+2]+=L[p]; acc[o+3]+=A[p]; acc[o+4]+=B[p]; acc[o+5]+=D[p]; acc[o+6]++; }
+    for(let k=0;k<K;k++){ const o=k*7, n=acc[o+6]; if(!n) continue; cx[k]=acc[o]/n; cy[k]=acc[o+1]/n; cl[k]=acc[o+2]/n; ca[k]=acc[o+3]/n; cb[k]=acc[o+4]/n; cd[k]=acc[o+5]/n; }
+  }
+  // つながっていない切れ端は隣の領域に入れ、領域に番号を振り直す
+  const rg=new Int32Array(N).fill(-1), q=new Int32Array(N); let nr=0; const minSp=Math.max(4,(step*step)>>3);
+  for(let s=0;s<N;s++){ if(rg[s]>=0) continue;
+    const c=sp[s], x=s%W; let near=-1; if(x>0&&rg[s-1]>=0) near=rg[s-1]; else if(s>=W&&rg[s-W]>=0) near=rg[s-W];
+    let h=0,tl=0; q[tl++]=s; rg[s]=nr;
+    while(h<tl){ const p=q[h++], x=p%W;
+      if(x>0 && rg[p-1]<0 && sp[p-1]===c){ rg[p-1]=nr; q[tl++]=p-1; }
+      if(x<W-1 && rg[p+1]<0 && sp[p+1]===c){ rg[p+1]=nr; q[tl++]=p+1; }
+      if(p>=W && rg[p-W]<0 && sp[p-W]===c){ rg[p-W]=nr; q[tl++]=p-W; }
+      if(p<N-W && rg[p+W]<0 && sp[p+W]===c){ rg[p+W]=nr; q[tl++]=p+W; } }
+    if(tl<minSp && near>=0){ for(let j=0;j<tl;j++) rg[q[j]]=near; } else nr++; }
+  // 領域ごとの色（平均）と奥行き（中央値）
+  const area=new Float64Array(nr), rl=new Float64Array(nr), ra=new Float64Array(nr), rb=new Float64Array(nr), rd=new Float32Array(nr);
+  for(let p=0;p<N;p++){ const r=rg[p]; area[r]++; rl[r]+=L[p]; ra[r]+=A[p]; rb[r]+=B[p]; }
+  const start=new Int32Array(nr+1); for(let r=0;r<nr;r++) start[r+1]=start[r]+area[r];
+  const fill=start.slice(0,nr), sorted=new Float32Array(N);
+  for(let p=0;p<N;p++) sorted[fill[rg[p]]++]=D[p];
+  for(let r=0;r<nr;r++){ const sl=sorted.subarray(start[r],start[r+1]); sl.sort(); rd[r]=sl[sl.length>>1]; }
+
+  // 2. 色がほぼ同じで、奥行きが段差なく続く隣どうしをつなぐ（色の近い順に）
+  const seen=new Set(), edges=[];
+  function edge(a,b){ if(a===b) return; const key= a<b ? a*nr+b : b*nr+a; if(seen.has(key)) return; seen.add(key);
+    const n1=area[a], n2=area[b]; edges.push([Math.hypot(rl[a]/n1-rl[b]/n2, ra[a]/n1-ra[b]/n2, rb[a]/n1-rb[b]/n2), a, b]); }
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){ const p=y*W+x; if(x<W-1) edge(rg[p],rg[p+1]); if(y<H-1) edge(rg[p],rg[p+W]); }
+  edges.sort(function(u,v){ return u[0]-v[0]; });
+  const root=new Int32Array(nr); for(let r=0;r<nr;r++) root[r]=r;
+  function find(r){ while(root[r]!==r){ root[r]=root[root[r]]; r=root[r]; } return r; }
+  const ml=rl.slice(), ma=ra.slice(), mb=rb.slice(), mn=area.slice();
+  for(let e=0;e<edges.length;e++){ if(edges[e][0]>=MERGE_COLOR) break;
+    const a=edges[e][1], b=edges[e][2], u=find(a), v=find(b); if(u===v) continue;
+    if(Math.abs(rd[a]-rd[b])>=MERGE_DEPTH) continue;
+    if(Math.hypot(ml[u]/mn[u]-ml[v]/mn[v], ma[u]/mn[u]-ma[v]/mn[v], mb[u]/mn[u]-mb[v]/mn[v])>=MERGE_COLOR) continue;
+    root[v]=u; ml[u]+=ml[v]; ma[u]+=ma[v]; mb[u]+=mb[v]; mn[u]+=mn[v]; }
+  // つないだまとまりの奥行き = 面積で重みをつけた中央値
+  const members={}; for(let r=0;r<nr;r++){ const u=find(r); (members[u]||(members[u]=[])).push(r); }
+  const obj=[];   // {d:奥行き, n:面積, m:含まれる領域}
+  for(const u in members){ const m=members[u]; m.sort(function(a,b){ return rd[a]-rd[b]; });
+    let half=mn[u]/2, d=rd[m[m.length-1]]; for(let j=0;j<m.length;j++){ half-=area[m[j]]; if(half<=0){ d=rd[m[j]]; break; } }
+    obj.push({d:d, n:mn[u], m:m}); }
+
+  // 3. 奥行きを段に分ける（面積で重みをつけた k-means。近すぎる段はまとめる）
+  const k=Math.max(2,Math.min(MAX_LAYERS,maxLayers)+1);
+  obj.sort(function(a,b){ return a.d-b.d; });
+  const cen=[]; { let run=0, j=0; for(let c=0;c<k;c++){ const want=(c+0.5)/k*N; while(j<obj.length-1 && run+obj[j].n<want){ run+=obj[j].n; j++; } cen.push(obj[j].d); } }
+  for(let it=0;it<30;it++){ const sum=new Float64Array(k), cnt=new Float64Array(k);
+    for(let j=0;j<obj.length;j++){ let b=0; for(let c=1;c<k;c++) if(Math.abs(obj[j].d-cen[c])<Math.abs(obj[j].d-cen[b])) b=c; sum[b]+=obj[j].d*obj[j].n; cnt[b]+=obj[j].n; }
+    for(let c=0;c<k;c++) if(cnt[c]) cen[c]=sum[c]/cnt[c]; }
+  const order=cen.slice().sort(function(a,b){ return a-b; }), cuts=[];   // 段の境目（奥から）
+  for(let c=1;c<k;c++) if(order[c]-order[c-1]>=LEVEL_GAP) cuts.push((order[c]+order[c-1])/2);
+  // 境目は、その奥行きの画素が少ないところ（物と物のすき間）へ少し寄せる
+  const hist=new Float32Array(101); for(let p=0;p<N;p++) hist[Math.round(D[p])]++;
+  for(let pass=0;pass<2;pass++){ const t=hist.slice(); for(let i=0;i<=100;i++) hist[i]=(t[Math.max(0,i-1)]+t[i]*2+t[Math.min(100,i+1)])/4; }
+  for(let c=0;c<cuts.length;c++){ const at=Math.round(cuts[c]); let b=at;
+    for(let i=Math.max(1,at-CUT_SNAP);i<=Math.min(99,at+CUT_SNAP);i++) if(hist[i]<hist[b]*0.85) b=i;
+    if(b!==at && (c===0||b>cuts[c-1]+LEVEL_GAP/2)) cuts[c]=b; }
+  const lay=new Uint8Array(N), rlay=new Uint8Array(nr);
+  for(let j=0;j<obj.length;j++){ let lv=0; while(lv<cuts.length && obj[j].d>cuts[lv]) lv++; for(let i=0;i<obj[j].m.length;i++) rlay[obj[j].m[i]]=lv; }
+  for(let p=0;p<N;p++) lay[p]=rlay[rg[p]];
+  // 色の境目がないのに段が分かれる所（ぼけた背景やなだらかな面）は、
+  // 領域の形ではなく奥行きそのものの等高線で分ける。境目がなめらかになる
+  const softLo=new Uint8Array(nr).fill(255), softHi=new Uint8Array(nr);
+  for(let e=0;e<edges.length;e++){ if(edges[e][0]>=SOFT_COLOR) break;
+    const a=edges[e][1], b=edges[e][2], u=rlay[a], v=rlay[b]; if(u===v) continue;
+    const mn2=Math.min(u,v), mx2=Math.max(u,v);
+    if(mn2<softLo[a]) softLo[a]=mn2; if(mx2>softHi[a]) softHi[a]=mx2;
+    if(mn2<softLo[b]) softLo[b]=mn2; if(mx2>softHi[b]) softHi[b]=mx2; }
+  let Ds=D; for(let pass=0;pass<3;pass++) Ds=blur(Ds);
+  for(let p=0;p<N;p++){ const r=rg[p]; if(softLo[r]===255) continue;
+    let lv=softLo[r]; while(lv<softHi[r] && Ds[p]>cuts[lv]) lv++; lay[p]=lv; }
+
+  // 4. 小さな飛び地は、いちばん長く接している層に吸収する
+  const minArea=N*ISLAND, comp=new Int32Array(N), tally=new Int32Array(cuts.length+1);
+  for(let pass=0;pass<3;pass++){ comp.fill(-1); let changed=false;
+    for(let s=0;s<N;s++){ if(comp[s]>=0) continue;
+      const c=lay[s]; let h=0,tl=0; q[tl++]=s; comp[s]=s; tally.fill(0);
+      while(h<tl){ const p=q[h++], x=p%W;
+        if(x>0){ if(lay[p-1]!==c) tally[lay[p-1]]++; else if(comp[p-1]<0){ comp[p-1]=s; q[tl++]=p-1; } }
+        if(x<W-1){ if(lay[p+1]!==c) tally[lay[p+1]]++; else if(comp[p+1]<0){ comp[p+1]=s; q[tl++]=p+1; } }
+        if(p>=W){ if(lay[p-W]!==c) tally[lay[p-W]]++; else if(comp[p-W]<0){ comp[p-W]=s; q[tl++]=p-W; } }
+        if(p<N-W){ if(lay[p+W]!==c) tally[lay[p+W]]++; else if(comp[p+W]<0){ comp[p+W]=s; q[tl++]=p+W; } } }
+      if(tl>=minArea) continue;
+      let b=-1; for(let c2=0;c2<tally.length;c2++) if(tally[c2] && (b<0||tally[c2]>tally[b])) b=c2;
+      if(b<0) continue;
+      for(let j=0;j<tl;j++) lay[q[j]]=b; changed=true; }
+    if(!changed) break; }
+  // 使われている段だけを、奥から順に層にする（いちばん奥は土台）
+  const used=new Uint8Array(cuts.length+1); for(let p=0;p<N;p++) used[lay[p]]=1;
+  S.layers=[]; const ids=[]; let first=true;
+  for(let lv=0;lv<used.length;lv++){ if(!used[lv]){ ids.push(0); continue; } if(first){ first=false; ids.push(0); continue; } const l=addLayer(); ids.push(l?l.id:0); }
+  for(let p=0;p<N;p++) S.labels[p]=ids[lay[p]];
+  S.active = S.layers.length ? S.layers[S.layers.length-1].id : 0;
+  structDirty=true; maskDirty=true;
+  return true;
+}
+
+/* 奥行き推定AI（Depth Anything V2 small）。ブラウザの中で動き、画像は外に送られない。
+   初めて「自動で分ける」を使うときにモデル（約25MB）を読み込む。 */
+const DEPTH_MODEL='onnx-community/depth-anything-v2-small';
+const DEPTH={pipe:null, image:0};
+let libP=null, aiQueue=Promise.resolve();
+// 物体AIと奥行きAIは同じ推論エンジンを使うので、同時に動かさず順番に実行する
+function aiExclusive(fn){ const r=aiQueue.then(fn); aiQueue=r.catch(function(){}); return r; }
+function aiLib(){ return libP||(libP=import(AI_LIB)); }
+async function depthMap(){
+  if(S.depth) return S.depth;
+  const image=DEPTH.image, T=await aiLib();
+  if(!DEPTH.pipe){
+    const seen={};
+    DEPTH.pipe=T.pipeline('depth-estimation',DEPTH_MODEL,{progress_callback:function(p){ if(p&&p.status==='progress'&&p.total){ seen[p.file]=[p.loaded,p.total]; let a=0,b=0; for(const k in seen){ a+=seen[k][0]; b+=seen[k][1]; } aiSay('奥行きモデルを読み込み中… '+Math.round(a/b*100)+'%（初回のみ）'); } }});
+    DEPTH.pipe.catch(function(){ DEPTH.pipe=null; });
+  }
+  const pipe=await DEPTH.pipe;
+  if(image!==DEPTH.image) return null;
+  aiSay('奥行きを解析中…（数秒〜数十秒）');
+  await new Promise(function(r){ setTimeout(r,30); });
+  const out=await aiExclusive(function(){ return image===DEPTH.image ? pipe(T.RawImage.fromCanvas(S.small).rgb()) : null; });
+  if(!out) return null;
+  if(image!==DEPTH.image) return null;
+  const im=out.depth, w=im.width, h=im.height, ch=im.channels||1, W=S.LW, H=S.LH, d=new Float32Array(W*H);
+  for(let y=0;y<H;y++){ const sy=Math.min(h-1,Math.floor((y+0.5)*h/H)); for(let x=0;x<W;x++){ const sx=Math.min(w-1,Math.floor((x+0.5)*w/W)); d[y*W+x]=im.data[(sy*w+sx)*ch]; } }
+  S.depth=d;
+  return d;
+}
+let autoBusy=false, autoAgain=false;
+async function autoSplit(){
+  if(!S.labels) return;
+  if(autoBusy){ autoAgain=true; return; }   // 終わったらもう一度（途中で画像が変わったとき）
+  autoBusy=true; $('autoBtn').disabled=true;
+  const image=DEPTH.image, n=parseInt($('autoN').value,10);
+  let dep=null, failed='';
+  try{ dep=await depthMap(); }catch(err){ console.error(err); failed=String(err&&err.message||err).slice(0,120)||'不明なエラー'; }
+  if(image===DEPTH.image){
+    pushUndo();
+    if(dep && depthSplit(dep,n)){ aiSay('奥行きで層に分けました。層の数を変えて「自動で分ける」をもう一度押すと分け直せます。'); }
+    else{ colorSplit(n); if(failed) aiSay('奥行きを調べられなかったので、色のまとまりで分けました。（理由：'+failed+'）'); }
+    renderList(); drawPaint();
+  }
+  autoBusy=false; $('autoBtn').disabled=false;
+  if(autoAgain){ autoAgain=false; autoSplit(); }
+}
+
 /* ---------- 塗り分け ---------- */
 function flood(x0,y0,tol,id){
   const W=S.LW,H=S.LH,px=S.px,seen=new Uint8Array(W*H),stack=new Int32Array(W*H);
@@ -386,8 +584,9 @@ function aiEmbed(){
   setTimeout(async function(){
     try{
       const img=AI.T.RawImage.fromCanvas(S.small).rgb();
-      const inputs=await AI.processor(img);
-      const emb=await AI.model.get_image_embeddings(inputs);
+      const r=await aiExclusive(async function(){ if(ticket!==AI.ticket) return null; const inputs=await AI.processor(img); return {inputs:inputs, emb:await AI.model.get_image_embeddings(inputs)}; });
+      if(!r) return;
+      const inputs=r.inputs, emb=r.emb;
       if(ticket!==AI.ticket) return;
       AI.inputs=inputs; AI.emb=emb;
       aiSay('準備できました。「物体」でタップすると輪郭を選びます。');
@@ -403,7 +602,7 @@ async function aiPick(x,y){
     const rs=AI.inputs.reshaped_input_sizes[0];        // [高さ, 幅]
     const pts=new AI.T.Tensor('float32',new Float32Array([x/S.LW*rs[1], y/S.LH*rs[0]]),[1,1,1,2]);
     const lbl=new AI.T.Tensor('int64',new BigInt64Array([BigInt(1)]),[1,1,1]);
-    const out=await AI.model(Object.assign({},AI.emb,{input_points:pts,input_labels:lbl}));
+    const out=await aiExclusive(function(){ return AI.model(Object.assign({},AI.emb,{input_points:pts,input_labels:lbl})); });
     const masks=await AI.processor.post_process_masks(out.pred_masks,AI.inputs.original_sizes,AI.inputs.reshaped_input_sizes);
     const m=masks[0], H=m.dims[m.dims.length-2], W=m.dims[m.dims.length-1], n=m.dims[m.dims.length-3];
     if(W!==S.LW||H!==S.LH) throw new Error('mask size');
@@ -420,7 +619,7 @@ async function aiPick(x,y){
   AI.busy=false;
 }
 function aiLoad(){
-  import(AI_LIB).then(async function(T){
+  aiLib().then(async function(T){
     const seen={};
     function prog(p){ if(p&&p.status==='progress'&&p.total){ seen[p.file]=[p.loaded,p.total]; let a=0,b=0; for(const k in seen){ a+=seen[k][0]; b+=seen[k][1]; } aiSay('モデルを読み込み中… '+Math.round(a/b*100)+'%（初回のみ）'); } }
     const model=await T.SamModel.from_pretrained(AI_MODEL,{progress_callback:prog});
@@ -463,7 +662,7 @@ function renderList(){
   $('addBtn').disabled = S.layers.length>=MAX_LAYERS;
 }
 $('addBtn').addEventListener('click',function(){ pushUndo(); addLayer(); renderList(); drawPaint(); });
-$('autoBtn').addEventListener('click',function(){ pushUndo(); autoSplit(parseInt($('autoN').value,10)); renderList(); drawPaint(); });
+$('autoBtn').addEventListener('click',autoSplit);
 $('undoBtn').addEventListener('click',undo);
 
 /* ---------- 道具 ---------- */
@@ -497,7 +696,7 @@ $('file').addEventListener('change',function(){
   this.value='';
   function ready(src){
     setImage(src);
-    if(AI.model){ addLayer(); } else { autoSplit(parseInt($('autoN').value,10)); }
+    autoSplit();
     renderList(); fitPaint(); drawPaint(); resize3D();
     $('hint').textContent=HINTS[S.tool];
   }
