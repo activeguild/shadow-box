@@ -457,7 +457,9 @@ function depthSplit(dep, maxLayers){
    初めて「自動で分ける」を使うときにモデル（約25MB）を読み込む。 */
 const DEPTH_MODEL='onnx-community/depth-anything-v2-small';
 const DEPTH={pipe:null, image:0};
-let libP=null;
+let libP=null, aiQueue=Promise.resolve();
+// 物体AIと奥行きAIは同じ推論エンジンを使うので、同時に動かさず順番に実行する
+function aiExclusive(fn){ const r=aiQueue.then(fn); aiQueue=r.catch(function(){}); return r; }
 function aiLib(){ return libP||(libP=import(AI_LIB)); }
 async function depthMap(){
   if(S.depth) return S.depth;
@@ -471,27 +473,30 @@ async function depthMap(){
   if(image!==DEPTH.image) return null;
   aiSay('奥行きを解析中…（数秒〜数十秒）');
   await new Promise(function(r){ setTimeout(r,30); });
-  const out=await pipe(T.RawImage.fromCanvas(S.small).rgb());
+  const out=await aiExclusive(function(){ return image===DEPTH.image ? pipe(T.RawImage.fromCanvas(S.small).rgb()) : null; });
+  if(!out) return null;
   if(image!==DEPTH.image) return null;
   const im=out.depth, w=im.width, h=im.height, ch=im.channels||1, W=S.LW, H=S.LH, d=new Float32Array(W*H);
   for(let y=0;y<H;y++){ const sy=Math.min(h-1,Math.floor((y+0.5)*h/H)); for(let x=0;x<W;x++){ const sx=Math.min(w-1,Math.floor((x+0.5)*w/W)); d[y*W+x]=im.data[(sy*w+sx)*ch]; } }
   S.depth=d;
   return d;
 }
-let autoBusy=false;
+let autoBusy=false, autoAgain=false;
 async function autoSplit(){
-  if(autoBusy||!S.labels) return;
+  if(!S.labels) return;
+  if(autoBusy){ autoAgain=true; return; }   // 終わったらもう一度（途中で画像が変わったとき）
   autoBusy=true; $('autoBtn').disabled=true;
   const image=DEPTH.image, n=parseInt($('autoN').value,10);
-  let dep=null, failed=false;
-  try{ dep=await depthMap(); }catch(err){ console.error(err); failed=true; }
+  let dep=null, failed='';
+  try{ dep=await depthMap(); }catch(err){ console.error(err); failed=String(err&&err.message||err).slice(0,120)||'不明なエラー'; }
   if(image===DEPTH.image){
     pushUndo();
     if(dep && depthSplit(dep,n)){ aiSay('奥行きで層に分けました。層の数を変えて「自動で分ける」をもう一度押すと分け直せます。'); }
-    else{ colorSplit(n); if(failed) aiSay('奥行きを調べられなかったので、色のまとまりで分けました。'); }
+    else{ colorSplit(n); if(failed) aiSay('奥行きを調べられなかったので、色のまとまりで分けました。（理由：'+failed+'）'); }
     renderList(); drawPaint();
   }
   autoBusy=false; $('autoBtn').disabled=false;
+  if(autoAgain){ autoAgain=false; autoSplit(); }
 }
 
 /* ---------- 塗り分け ---------- */
@@ -579,8 +584,9 @@ function aiEmbed(){
   setTimeout(async function(){
     try{
       const img=AI.T.RawImage.fromCanvas(S.small).rgb();
-      const inputs=await AI.processor(img);
-      const emb=await AI.model.get_image_embeddings(inputs);
+      const r=await aiExclusive(async function(){ if(ticket!==AI.ticket) return null; const inputs=await AI.processor(img); return {inputs:inputs, emb:await AI.model.get_image_embeddings(inputs)}; });
+      if(!r) return;
+      const inputs=r.inputs, emb=r.emb;
       if(ticket!==AI.ticket) return;
       AI.inputs=inputs; AI.emb=emb;
       aiSay('準備できました。「物体」でタップすると輪郭を選びます。');
@@ -596,7 +602,7 @@ async function aiPick(x,y){
     const rs=AI.inputs.reshaped_input_sizes[0];        // [高さ, 幅]
     const pts=new AI.T.Tensor('float32',new Float32Array([x/S.LW*rs[1], y/S.LH*rs[0]]),[1,1,1,2]);
     const lbl=new AI.T.Tensor('int64',new BigInt64Array([BigInt(1)]),[1,1,1]);
-    const out=await AI.model(Object.assign({},AI.emb,{input_points:pts,input_labels:lbl}));
+    const out=await aiExclusive(function(){ return AI.model(Object.assign({},AI.emb,{input_points:pts,input_labels:lbl})); });
     const masks=await AI.processor.post_process_masks(out.pred_masks,AI.inputs.original_sizes,AI.inputs.reshaped_input_sizes);
     const m=masks[0], H=m.dims[m.dims.length-2], W=m.dims[m.dims.length-1], n=m.dims[m.dims.length-3];
     if(W!==S.LW||H!==S.LH) throw new Error('mask size');
@@ -690,7 +696,7 @@ $('file').addEventListener('change',function(){
   this.value='';
   function ready(src){
     setImage(src);
-    if(AI.model){ addLayer(); } else { autoSplit(); }
+    autoSplit();
     renderList(); fitPaint(); drawPaint(); resize3D();
     $('hint').textContent=HINTS[S.tool];
   }
